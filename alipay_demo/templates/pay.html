@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>扫码支付</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .container { text-align: center; background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.1); min-width: 300px; }
+        h2 { margin-bottom: 20px; color: #333; }
+        .amount { font-size: 32px; color: #ff4d4f; font-weight: bold; margin-bottom: 24px; }
+        #qr-wrap { margin-bottom: 20px; display: flex; justify-content: center; }
+        .hint { color: #666; font-size: 14px; margin-bottom: 20px; }
+        .status { padding: 12px 24px; border-radius: 8px; display: inline-block; font-size: 16px; }
+        .waiting { background: #fff7e6; color: #d46b08; }
+        .success { background: #f6ffed; color: #389e0d; }
+        .error   { background: #fff2f0; color: #cf1322; }
+
+        /* 支付成功遮罩 */
+        #success-mask {
+            display: none;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+        }
+        #success-mask .icon { font-size: 64px; margin-bottom: 16px; }
+        #success-mask .title { font-size: 24px; font-weight: bold; color: #389e0d; margin-bottom: 8px; }
+        #success-mask .sub   { font-size: 14px; color: #666; }
+
+        /* 关闭倒计时 */
+        #countdown { font-size: 13px; color: #aaa; margin-top: 16px; }
+    </style>
+    <script src="https://cdn.bootcdn.net/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <!-- 支付中视图 -->
+        <div id="pay-view">
+            <h2 id="subject">商品标题</h2>
+            <div class="amount" id="amount">¥0.00</div>
+            <div id="qr-wrap"></div>
+            <div class="hint" id="hint">正在加载二维码...</div>
+            <div class="status waiting" id="status">等待付款...</div>
+        </div>
+
+        <!-- 支付成功视图（默认隐藏） -->
+        <div id="success-mask">
+            <div class="icon">✅</div>
+            <div class="title">支付成功！</div>
+            <div class="sub" id="pay-amount-tip"></div>
+            <div id="countdown"></div>
+        </div>
+
+        <!-- 订单关闭视图（默认隐藏） -->
+        <div id="closed-view" style="display:none">
+            <div style="font-size:48px;margin-bottom:12px">❌</div>
+            <div style="font-size:20px;color:#cf1322;font-weight:bold">订单已关闭</div>
+        </div>
+    </div>
+
+<script>
+const orderId = '{{ order_id }}';
+const qrCode  = '{{ qr_code }}';
+const amount  = parseFloat('{{ amount }}') || 0;
+const subject = '{{ subject }}';
+
+document.getElementById('subject').textContent = subject;
+document.getElementById('amount').textContent  = '¥' + amount.toFixed(2);
+
+// 生成二维码
+new QRCode(document.getElementById('qr-wrap'), {
+    text: qrCode,
+    width: 200,
+    height: 200
+});
+document.getElementById('hint').textContent = '请使用支付宝扫描二维码付款';
+
+function showSuccess() {
+    // 隐藏支付视图（二维码彻底消失）
+    document.getElementById('pay-view').style.display  = 'none';
+    // 显示成功视图
+    const mask = document.getElementById('success-mask');
+    mask.style.display = 'flex';
+    document.getElementById('pay-amount-tip').textContent = '实付 ¥' + amount.toFixed(2);
+
+    // 倒计时 5 秒后关闭/刷新（可自行改成跳转）
+    let sec = 5;
+    const cd = document.getElementById('countdown');
+    cd.textContent = sec + ' 秒后自动关闭页面...';
+    const t = setInterval(() => {
+        sec--;
+        if (sec <= 0) {
+            clearInterval(t);
+            window.close();           // 尝试关闭标签页
+            // 若无法关闭则跳转首页
+            setTimeout(() => { window.location.href = '/'; }, 300);
+        } else {
+            cd.textContent = sec + ' 秒后自动关闭页面...';
+        }
+    }, 1000);
+}
+
+function showClosed() {
+    document.getElementById('pay-view').style.display    = 'none';
+    document.getElementById('success-mask').style.display = 'none';
+    document.getElementById('closed-view').style.display = 'block';
+}
+
+// 轮询订单状态（每 2 秒一次）
+const pollTimer = setInterval(() => {
+    fetch('/api/order/query/' + orderId)
+        .then(r => r.json())
+        .then(data => {
+            const st = (data.trade_status || '').trim();
+            if (st === 'TRADE_SUCCESS' || st === 'TRADE_FINISHED') {
+                clearInterval(pollTimer);
+                showSuccess();
+            } else if (st === 'TRADE_CLOSED') {
+                clearInterval(pollTimer);
+                showClosed();
+            }
+        })
+        .catch(() => {}); // 忽略网络错误，继续轮询
+}, 2000);
+
+// 5 分钟后停止轮询（二维码一般 5 分钟过期）
+setTimeout(() => {
+    clearInterval(pollTimer);
+    document.getElementById('status').className   = 'status error';
+    document.getElementById('status').textContent = '二维码已过期，请刷新重试';
+    document.getElementById('qr-wrap').style.opacity  = '0.2';
+    document.getElementById('hint').textContent   = '二维码已失效';
+}, 5 * 60 * 1000);
+</script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+# Python >= 3.11 required
+
+# 支付宝SDK（最新版）
+alipay-sdk-python>=3.7.1018
+
+# Web框架
+flask>=3.0.0
+
+# HTTP请求
+requests>=2.31.0
+
+# RSA签名（替代pycrypto，支持Python 3.11+）
+pycryptodome>=3.19.0
+
+# 环境变量配置管理
+python-dotenv>=1.0.0

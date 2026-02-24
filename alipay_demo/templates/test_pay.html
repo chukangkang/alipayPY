@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>支付测试</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
+        .container { text-align: center; background: #fff; padding: 40px; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,.1); }
+        h2 { margin-bottom: 20px; color: #333; }
+        .form-group { margin-bottom: 16px; text-align: left; }
+        label { display: block; margin-bottom: 6px; color: #666; font-size: 14px; }
+        input { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 16px; box-sizing: border-box; }
+        input:focus { outline: none; border-color: #1677ff; }
+        .btn { width: 100%; padding: 12px; background: #1677ff; color: #fff; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 10px; }
+        .btn:hover { background: #4096ff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>支付宝支付测试</h2>
+        
+        <div class="form-group">
+            <label>金额（元）</label>
+            <input type="number" id="amount" value="0.01" step="0.01" min="0.01">
+        </div>
+        
+        <div class="form-group">
+            <label>商品标题</label>
+            <input type="text" id="subject" value="测试商品">
+        </div>
+        
+        <button class="btn" id="payBtn">立即支付</button>
+    </div>
+
+<script>
+function doPay() {
+    const amount = document.getElementById('amount').value;
+    const subject = document.getElementById('subject').value;
+    
+    if (!amount || parseFloat(amount) <= 0) {
+        alert('请输入有效金额');
+        return;
+    }
+    
+    if (!subject) {
+        alert('请输入商品标题');
+        return;
+    }
+    
+    // 新标签页打开支付页面，当前页面保持不变
+    window.open(`/paynow?amount=${amount}&subject=${encodeURIComponent(subject)}`, '_blank');
+}
+
+document.getElementById('payBtn').addEventListener('click', doPay);
+</script>
+</body>
+</html>
