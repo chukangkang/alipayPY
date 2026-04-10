@@ -138,14 +138,16 @@ def notify_new_api_async(order: PayOrder):
     """异步通知 New-API（在后台线程执行）【新增】"""
     def do_notify():
         try:
-            # 构建回调参数
+            # 构建回调参数（包含 name 和 trade_status，确保与 epay-proxy 兼容）
             notify_params = build_epay_notify_params(
                 order_id=order.out_trade_no,
                 trade_no=order.trade_no or "",
                 money=str(order.money),
                 pid=order.pid or config.epay_merchant_id,
                 type_=order.type or 'alipay',
-                status=1  # 已支付
+                status=1,  # 已支付
+                name=order.name or "",  # 商品名称
+                trade_status='TRADE_SUCCESS'  # 交易成功
             )
             
             # 签名

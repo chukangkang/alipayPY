@@ -50,17 +50,17 @@ def sign_epay(params: Dict[str, str], merchant_key: str) -> str:
         sign = sign_epay(params, 'xm3787562987')
         # → '5d41402abc4b2a76b9719d911017c592'
     """
-    # 过滤：排除 sign、sign_type 和空值
+    # 过滤：排除 sign、sign_type 和空值（保持原始类型）
     filtered_params = {
-        k: str(v) for k, v in params.items()
+        k: v for k, v in params.items()
         if k not in ('sign', 'sign_type') and v is not None and str(v).strip()
     }
     
     # 按 key 字母升序排序
-    sorted_params = dict(sorted(filtered_params.items()))
+    sorted_keys = sorted(filtered_params.keys())
     
     # 拼接字符串：key1=value1&key2=value2&...&keyN=valueN
-    sign_parts = [f"{k}={v}" for k, v in sorted_params.items()]
+    sign_parts = [f"{k}={filtered_params[k]}" for k in sorted_keys]
     sign_string = '&'.join(sign_parts)
     
     # 末尾直接追加商户密钥（无 & 分隔符）
@@ -125,7 +125,9 @@ def build_epay_notify_params(
     money: str,
     pid: int,
     type_: str = 'alipay',
-    status: int = 1
+    status: int = 1,
+    name: str = '',
+    trade_status: str = 'TRADE_SUCCESS'
 ) -> Dict[str, str]:
     """
     构建 EPay 回调参数（用于回调 New-API）
@@ -137,6 +139,8 @@ def build_epay_notify_params(
         pid: 商户 ID
         type_: 支付类型（alipay/wxpay）
         status: 支付状态（1=已支付）
+        name: 商品名称（可选）
+        trade_status: 交易状态（TRADE_SUCCESS 等）
     
     返回：
         待签名的参数字典
@@ -147,7 +151,8 @@ def build_epay_notify_params(
             trade_no='2024041000001234',
             money='100.00',
             pid=1673765678,
-            type_='alipay'
+            type_='alipay',
+            name='充值100元'
         )
         sign = sign_epay(params, merchant_key)
         params['sign'] = sign
@@ -155,11 +160,18 @@ def build_epay_notify_params(
         # 现在可以 POST 发送给 New-API
     """
     params = {
-        'trade_no': str(trade_no),
-        'out_trade_no': str(order_id),
-        'money': str(money),
         'pid': str(pid),
         'type': str(type_),
+        'out_trade_no': str(order_id),
+        'trade_no': str(trade_no),
+        'money': str(money),
         'status': str(status),
     }
+    
+    # 添加可选字段
+    if name:
+        params['name'] = str(name)
+    if trade_status:
+        params['trade_status'] = str(trade_status)
+    
     return params
