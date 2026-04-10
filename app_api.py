@@ -1,18 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-支付宝当面付 API 服务
+支付宝当面付 API 服务 + New-API EPay 协议支持【改造版】
 供其他项目对接调用、本地测试使用
 
-配置从 alipay_config 中读取，支持 .env 环境变量配置
+【新增功能】
+- /submit.php - EPay 协议下单接口（New-API 调用）
+- /api/check-status - 订单状态查询接口
+- 支付成功后回调 New-API 的 notify_url
+- 订单数据持久化到数据库
 """
 
 import uuid
 import logging
+import requests
+import threading
+from typing import Any, Optional, Dict, Tuple
+from datetime import datetime
 from functools import wraps
-from typing import Any, Callable, Optional
+
 from flask import Flask, request, jsonify, render_template, Response
+from sqlalchemy import create_engine, Column, String, Float, Integer, DateTime, Text
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
 from alipay_service import AlipayService, verify_sign
 from alipay_config import config
+from epay_util import sign_epay, verify_epay_sign, build_epay_notify_params
 
 # 设置日志
 logging.basicConfig(
@@ -23,8 +36,74 @@ logger = logging.getLogger(__name__)
 
 
 # =====================================================================
-#  辅助函数
+# 数据库配置【新增】
 # =====================================================================
+
+engine = create_engine(
+    config.db_url,
+    echo=False,
+    pool_pre_ping=True,  # SQLite 连接检测
+    connect_args={'check_same_thread': False} if 'sqlite' in config.db_url else {}
+)
+
+Base = declarative_base()
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class PayOrder(Base):
+    """支付订单模型【新增】"""
+    __tablename__ = 'pay_order'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # EPay 订单字段
+    out_trade_no = Column(String(64), unique=True, nullable=False, index=True)  # 商户订单号
+    trade_no = Column(String(64), nullable=True)  # 平台交易号
+    
+    # 商户信息
+    pid = Column(Integer, nullable=True)  # 商户 ID
+    type = Column(String(16), nullable=True)  # 支付类型 (alipay/wxpay)
+    
+    # 订单信息
+    name = Column(String(128), nullable=True)  # 商品名称
+    money = Column(Float, nullable=True)  # 金额（元）
+    
+    # 回调信息
+    notify_url = Column(String(512), nullable=True)  # 回调地址
+    return_url = Column(String(512), nullable=True)  # 返回地址
+    
+    # 状态
+    status = Column(Integer, default=0)  # 0=待支付, 1=已支付, 2=已通知
+    
+    # 第三方信息
+    alipay_trade_no = Column(String(64), nullable=True)  # 支付宝交易号
+    qr_code = Column(Text, nullable=True)  # 二维码 URL
+    
+    # 通知重试
+    notify_count = Column(Integer, default=0)  # 已通知次数
+    
+    # 时间戳
+    created_at = Column(DateTime, default=datetime.utcnow())
+    updated_at = Column(DateTime, default=datetime.utcnow(), onupdate=datetime.utcnow())
+
+
+# 创建表
+Base.metadata.create_all(bind=engine)
+
+
+# =====================================================================
+# 辅助函数
+# =====================================================================
+
+def get_db() -> Session:
+    """获取数据库会话"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 def validate_amount(amount: Any, field_name: str = "金额") -> float:
     """校验金额参数"""
     if not amount:
@@ -45,14 +124,91 @@ def validate_required(value: Any, field_name: str) -> str:
     return value_str
 
 
-def error_response(message: str, status: int = 400) -> tuple:
+def error_response(message: str, status: int = 400) -> Tuple:
     """返回错误响应"""
     return jsonify({'code': -1, 'message': message}), status
 
 
-def success_response(data: dict, status: int = 200) -> tuple:
+def success_response(data: dict, status: int = 200) -> Tuple:
     """返回成功响应"""
     return jsonify({'code': 0, **data}), status
+
+
+def notify_new_api_async(order: PayOrder):
+    """异步通知 New-API（在后台线程执行）【新增】"""
+    def do_notify():
+        try:
+            # 构建回调参数
+            notify_params = build_epay_notify_params(
+                order_id=order.out_trade_no,
+                trade_no=order.trade_no or "",
+                money=str(order.money),
+                pid=order.pid or config.epay_merchant_id,
+                type_=order.type or 'alipay',
+                status=1  # 已支付
+            )
+            
+            # 签名
+            sign = sign_epay(notify_params, config.epay_merchant_key)
+            notify_params['sign'] = sign
+            notify_params['sign_type'] = 'MD5'
+            
+            logger.info(f"回调 New-API: {order.notify_url}, params: {notify_params}")
+            
+            # 发送回调
+            response = requests.post(
+                order.notify_url,
+                data=notify_params,
+                timeout=10
+            )
+            
+            # 检查响应
+            if response.status_code == 200 and response.text.strip().lower() == 'success':
+                logger.info(f"✓ 回调成功: {order.out_trade_no}")
+                
+                # 更新订单状态
+                db = SessionLocal()
+                try:
+                    db_order = db.query(PayOrder).filter(
+                        PayOrder.out_trade_no == order.out_trade_no
+                    ).first()
+                    if db_order:
+                        db_order.status = 2  # 标记为已通知
+                        db_order.notify_count += 1
+                        db.commit()
+                except Exception as e:
+                    logger.error(f"更新订单状态失败: {e}")
+                finally:
+                    db.close()
+            else:
+                logger.warning(
+                    f"❌ 回调失败: {order.out_trade_no}, "
+                    f"status={response.status_code}, body={response.text[:100]}"
+                )
+                
+                # 增加重试计数
+                db = SessionLocal()
+                try:
+                    db_order = db.query(PayOrder).filter(
+                        PayOrder.out_trade_no == order.out_trade_no
+                    ).first()
+                    if db_order:
+                        db_order.notify_count += 1
+                        db.commit()
+                except Exception as e:
+                    logger.error(f"更新重试计数失败: {e}")
+                finally:
+                    db.close()
+        
+        except requests.RequestException as e:
+            logger.error(f"❌ 回调异常 ({order.out_trade_no}): {e}")
+        except Exception as e:
+            logger.error(f"❌ 回调异常 ({order.out_trade_no}): {e}")
+    
+    # 在后台线程执行
+    thread = threading.Thread(target=do_notify, daemon=True)
+    thread.start()
+
 
 # 创建 Flask 应用
 app = Flask(__name__)
@@ -69,9 +225,206 @@ except Exception as e:
 logger.info("="*60)
 
 
-# ------------------------------------------------------------------ #
-#  直接渲染支付宝扫码页面                                           #
-# ------------------------------------------------------------------ #
+# =====================================================================
+# 【新增】EPay 协议接口 - /submit.php
+# =====================================================================
+
+@app.route('/submit.php', methods=['GET', 'POST'])
+def submit_order():
+    """
+    EPay 兼容的下单接口 - New-API 调用此接口进行支付
+    
+    URL 参数（GET）或表单参数（POST）：
+    - pid: 商户 ID（必需）
+    - out_trade_no: 商户订单号（必需）
+    - type: 支付类型（必需）- alipay/wxpay
+    - money: 金额（元）（必需）
+    - name: 商品名称（必需）
+    - notify_url: 支付成功回调地址（必需）
+    - return_url: 支付成功返回地址（可选）
+    - sign: MD5 签名（必需）
+    - sign_type: 签名类型（必需） - MD5
+    
+    返回：
+    - 支付宝：直接返回支付宝收银台 HTML（自动跳转）
+    - 微信：返回二维码展示页面
+    """
+    # 获取参数
+    if request.method == 'GET':
+        params = request.args.to_dict()
+    else:
+        params = request.form.to_dict()
+    
+    logger.info(f"[EPay] 收到 /submit.php 请求, params: {params}")
+    
+    try:
+        # 1. 验证签名
+        if not verify_epay_sign(params, config.epay_merchant_key):
+            logger.warning(f"[EPay] ❌ 签名验证失败")
+            return "签名验证失败", 400
+        
+        # 2. 验证商户 ID
+        pid = int(params.get('pid', 0))
+        if pid != int(config.epay_merchant_id):
+            logger.warning(f"[EPay] ❌ 商户 ID 不匹配: {pid} != {config.epay_merchant_id}")
+            return "商户ID不匹配", 400
+        
+        # 3. 提取参数
+        out_trade_no = validate_required(params.get('out_trade_no'), "订单号")
+        pay_type = validate_required(params.get('type'), "支付类型")
+        money = validate_amount(params.get('money'), "金额")
+        name = validate_required(params.get('name'), "商品名称")
+        notify_url = validate_required(params.get('notify_url'), "回调地址")
+        return_url = params.get('return_url', '')
+        
+        # 4. 检查订单是否已存在（幂等性）
+        db = next(get_db())
+        existing_order = db.query(PayOrder).filter(
+            PayOrder.out_trade_no == out_trade_no
+        ).first()
+        
+        if existing_order:
+            logger.info(f"[EPay] 订单已存在, 直接返回: {out_trade_no}")
+            # 返回已有的支付信息
+            if existing_order.qr_code:
+                return render_template('pay.html',
+                    order_id=out_trade_no,
+                    qr_code=existing_order.qr_code,
+                    amount=str(existing_order.money),
+                    subject=existing_order.name
+                )
+        
+        # 5. 调用支付宝创建支付
+        logger.info(f"[EPay] 创建支付: order={out_trade_no}, type={pay_type}, amount={money}")
+        
+        if pay_type not in ('alipay', 'wxpay'):
+            raise ValueError(f"不支持的支付类型: {pay_type}")
+        
+        # 目前仅支持支付宝
+        if pay_type != 'alipay':
+            raise ValueError("暂仅支持支付宝支付")
+        
+        # 生成平台交易号
+        trade_no = f"EP{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
+        
+        # 调用支付宝 API
+        qr_code = alipay_service.create_qr_payment(
+            out_trade_no=out_trade_no,
+            total_amount=money,
+            subject=name
+        )
+        
+        # 6. 保存订单到数据库
+        order = PayOrder(
+            out_trade_no=out_trade_no,
+            trade_no=trade_no,
+            pid=pid,
+            type=pay_type,
+            name=name,
+            money=money,
+            notify_url=notify_url,
+            return_url=return_url or "",
+            qr_code=qr_code,
+            status=0  # 待支付
+        )
+        db.add(order)
+        db.commit()
+        db.refresh(order)
+        
+        logger.info(f"[EPay] ✓ 订单已创建: {out_trade_no}")
+        
+        # 7. 返回支付页面
+        return render_template('pay.html',
+            order_id=out_trade_no,
+            qr_code=qr_code,
+            amount=str(money),
+            subject=name
+        )
+    
+    except ValueError as e:
+        logger.error(f"[EPay] ❌ 参数错误: {e}")
+        return f"参数错误: {str(e)}", 400
+    except Exception as e:
+        logger.error(f"[EPay] ❌ 创建支付失败: {e}", exc_info=True)
+        return f"创建支付失败: {str(e)}", 500
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+@app.route('/api/check-status', methods=['GET'])
+def check_status():
+    """
+    查询订单状态（前端轮询使用）【新增】
+    
+    参数：
+    - out_trade_no: 商户订单号（必需）
+    
+    返回：
+    {
+        "status": 0/1/2,  // 0=失败, 1=成功, 2=已通知
+        "message": "状态说明"
+    }
+    """
+    out_trade_no = request.args.get('out_trade_no', '')
+    
+    if not out_trade_no:
+        return error_response("订单号不能为空")
+    
+    try:
+        db = next(get_db())
+        order = db.query(PayOrder).filter(
+            PayOrder.out_trade_no == out_trade_no
+        ).first()
+        
+        if not order:
+            return error_response("订单不存在", 404)
+        
+        # 查询支付宝订单状态
+        result = alipay_service.query_order(out_trade_no)
+        trade_status = result.get('trade_status', '')
+        
+        if trade_status in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
+            # 支付成功，更新本地订单
+            if order.status == 0:
+                order.status = 1  # 标记为已支付
+                order.alipay_trade_no = result.get('trade_no', '')
+                db.commit()
+                
+                # 异步回调 New-API
+                notify_new_api_async(order)
+            
+            return success_response({
+                'status': 1,
+                'message': '支付成功'
+            })
+        elif trade_status == 'TRADE_CLOSED':
+            return success_response({
+                'status': 0,
+                'message': '订单已关闭'
+            })
+        else:
+            return success_response({
+                'status': 0,
+                'message': '等待支付'
+            })
+    
+    except Exception as e:
+        logger.error(f"查询订单状态失败: {e}")
+        return error_response(str(e), 500)
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
+
+# =====================================================================
+# 【现有】直接渲染支付宝扫码页面
+# =====================================================================
+
 @app.route('/paynow')
 def pay_now() -> Response:
     """
@@ -127,39 +480,13 @@ def pay_now() -> Response:
         return f"❌ 支付创建失败：{str(e)}", 500
 
 
-# ------------------------------------------------------------------ #
-#  创建支付二维码（API 接口）                                        #
-# ------------------------------------------------------------------ #
+# =====================================================================
+# 【现有】其他接口
+# =====================================================================
+
 @app.route('/api/pay/create', methods=['POST'])
-def create_pay() -> tuple:
-    """
-    创建支付二维码（API 接口）
-
-    请求方式：POST
-    Content-Type: application/json
-
-    请求参数：
-    {
-        "out_trade_no": "订单号（可选，不传自动生成）",
-        "total_amount": 0.01,      # 订单金额（元），必需
-        "subject": "商品标题"       # 商品描述，必需
-    }
-
-    返回示例：
-    {
-        "code": 0,
-        "qr_code": "https://qr.alipay.com/xxx",
-        "order_id": "订单号",
-        "amount": 0.01,
-        "subject": "商品标题"
-    }
-
-    错误返回：
-    {
-        "code": -1,
-        "message": "错误信息"
-    }
-    """
+def create_pay() -> Tuple:
+    """创建支付二维码（API 接口）"""
     data = request.get_json() or {}
 
     # 参数提取和校验
@@ -181,7 +508,7 @@ def create_pay() -> tuple:
             total_amount=amount_float,
             subject=subject,
         )
-
+        
         logger.info(f"✓ API 创建支付成功: order_id={order_id}")
         host_url = request.host_url.rstrip('/')
 
@@ -198,35 +525,15 @@ def create_pay() -> tuple:
         return error_response(str(e), 500)
 
 
-# ------------------------------------------------------------------ #
-#  测试页面                                                          #
-# ------------------------------------------------------------------ #
 @app.route('/test')
 def test_page():
     """支付测试页面"""
     return render_template('test_pay.html')
 
 
-# ------------------------------------------------------------------ #
-#  查询订单状态                                                         #
-# ------------------------------------------------------------------ #
 @app.route('/api/order/query/<order_id>', methods=['GET'])
 def query_order(order_id):
-    """
-    查询订单状态
-    
-    URL 参数：
-    - order_id: 商户订单号（必需）
-    
-    返回示例：
-    {
-        "code": 0,
-        "order_id": "订单号",
-        "trade_status": "TRADE_SUCCESS",
-        "amount": "0.01",
-        "data": { ... 订单详情 ... }
-    }
-    """
+    """查询订单状态"""
     if not order_id or not order_id.strip():
         logger.warning("❌ 查询订单: 缺少订单号参数")
         return jsonify({'code': -1, 'message': '订单号不能为空'}), 400
@@ -257,24 +564,9 @@ def query_order(order_id):
         return jsonify({'code': -1, 'message': str(e)}), 500
 
 
-
-# ------------------------------------------------------------------ #
-#  撤销订单                                                            #
-# ------------------------------------------------------------------ #
 @app.route('/api/order/cancel/<order_id>', methods=['POST'])
 def cancel_order(order_id):
-    """
-    撤销订单
-    
-    URL 参数：
-    - order_id: 商户订单号（必需）
-    
-    返回成功示例：
-    {
-        "code": 0,
-        "data": { ... 撤销结果 ... }
-    }
-    """
+    """撤销订单"""
     if not order_id or not order_id.strip():
         logger.warning("❌ 撤销订单: 缺少订单号参数")
         return jsonify({'code': -1, 'message': '订单号不能为空'}), 400
@@ -291,31 +583,9 @@ def cancel_order(order_id):
         return jsonify({'code': -1, 'message': str(e)}), 500
 
 
-# ------------------------------------------------------------------ #
-#  退款                                                                #
-# ------------------------------------------------------------------ #
 @app.route('/api/refund', methods=['POST'])
-def refund() -> tuple:
-    """
-    订单退款
-
-    请求方式：POST
-    Content-Type: application/json
-
-    请求参数：
-    {
-        "out_trade_no": "原订单号",      # 必需
-        "refund_amount": 0.01,           # 退款金额（元），必需，不能大于订单金额
-        "reason": "退款原因"              # 可选
-    }
-
-    返回成功示例：
-    {
-        "code": 0,
-        "data": { ... 退款结果 ... },
-        "message": "退款成功"
-    }
-    """
+def refund() -> Tuple:
+    """订单退款"""
     data = request.get_json() or {}
 
     # 参数校验
@@ -344,18 +614,9 @@ def refund() -> tuple:
         return error_response(str(e), 500)
 
 
-# ------------------------------------------------------------------ #
-#  异步通知（支付宝服务器回调）                                           #
-# ------------------------------------------------------------------ #
 @app.route('/api/notify', methods=['POST'])
 def alipay_notify():
-    """
-    支付宝异步通知回调
-    
-    支付宝服务器会在交易成功时向该地址发送 POST 请求
-    返回字符串 'success' 表示已收到，否则支付宝会重试通知
-    
-    """
+    """支付宝异步通知回调"""
     params = request.form.to_dict()
     logger.info(f"[NOTIFY] 收到支付宝回调，参数: {params}")
 
@@ -395,24 +656,42 @@ def alipay_notify():
     # 处理不同的交易状态
     if trade_status in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
         logger.info(f"[NOTIFY] ✓ 订单已支付: {out_trade_no}")
-        # TODO: 在这里写业务逻辑（更新订单状态、发货等）
-        # 例如：
-        # - 更新数据库中订单的支付状态
-        # - 触发发货流程
-        # - 发送确认邮件等
+        
+        # 更新订单状态
+        try:
+            db = next(get_db())
+            order = db.query(PayOrder).filter(
+                PayOrder.out_trade_no == out_trade_no
+            ).first()
+            
+            if order:
+                if order.status == 0:  # 还未支付
+                    order.status = 1  # 标记为已支付
+                    order.alipay_trade_no = trade_no
+                    db.commit()
+                    
+                    # 异步回调 New-API
+                    notify_new_api_async(order)
+                else:
+                    logger.info(f"订单已处理，跳过: {out_trade_no}")
+            
+            db.close()
+        except Exception as e:
+            logger.error(f"处理支付宝通知异常: {e}", exc_info=True)
+        
         return 'success'
 
     elif trade_status == 'TRADE_CLOSED':
         logger.info(f"[NOTIFY] ⚠ 订单已关闭: {out_trade_no}")
-        # 订单未支付被关闭，可选处理
         return 'success'
 
     elif trade_status == 'WAIT_BUYER_PAY':
         logger.info(f"[NOTIFY] ⏳ 订单待支付: {out_trade_no}")
         return 'success'
 
-    logger.warning(f"[NOTIFY] 未处理的交易状态: {trade_status}")
-    return 'success'
+    else:
+        logger.warning(f"[NOTIFY] 未处理的交易状态: {trade_status}")
+        return 'success'
 
 
 @app.route('/api/notify', methods=['GET'])
@@ -424,14 +703,17 @@ def alipay_notify_check():
 if __name__ == '__main__':
     """启动 Flask 应用服务器"""
     logger.info("="*60)
-    logger.info(f"🚀 启动 Flask 应用")
+    logger.info(f"🚀 启动 Flask 应用【改造版 - 支持 New-API】")
     logger.info(f"  - 地址: {config.flask_host}:{config.flask_port}")
     logger.info(f"  - 环境: {config.flask_env}")
     logger.info(f"  - 支付宝沙箱: {config.is_sandbox}")
+    logger.info(f"  - EPay 商户ID: {config.epay_merchant_id}")
+    logger.info(f"  - 数据库: {config.db_url}")
     logger.info("="*60)
     
     app.run(
         host=config.flask_host,
         port=config.flask_port,
-        debug=(config.flask_env == 'development')
+        debug=(config.flask_env == 'development'),
+        threaded=True
     )

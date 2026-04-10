@@ -14,3 +14,9 @@ pycryptodome>=3.19.0
 
 # 环境变量配置管理
 python-dotenv>=1.0.0
+
+# 数据库 ORM【新增】
+sqlalchemy>=2.0.0
+
+# MySQL 驱动【可选，仅在使用 MySQL 时需要】
+# pymysql>=1.1.0

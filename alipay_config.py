@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-支付宝支付配置管理
+支付宝支付配置管理 + New-API EPay 配置
 从环境变量或 .env 文件读取配置，而不是硬编码敏感信息
 """
 
@@ -34,6 +34,8 @@ class Config:
 
         # 加载支付宝配置
         self._load_alipay_config()
+        # 加载 EPay 配置
+        self._load_epay_config()
         # 加载集成配置
         self._load_integration_config()
 
@@ -79,6 +81,42 @@ class Config:
         logger.debug(f"  - 沙箱环境: {self.is_sandbox}")
         logger.debug(f"  - 网关: {self.gateway}")
 
+    def _load_epay_config(self):
+        """加载 New-API EPay 相关配置【新增】"""
+        # EPay 商户配置（与 New-API 保持一致）
+        self.epay_merchant_id = os.getenv('EPAY_MERCHANT_ID', '1673765678').strip()
+        self.epay_merchant_key = os.getenv('EPAY_MERCHANT_KEY', '').strip()
+        
+        # 验证 EPay 必需配置
+        if not self.epay_merchant_key:
+            logger.warning("⚠️  未配置 EPAY_MERCHANT_KEY，EPay 接口将无法使用")
+        
+        # EPay 回调基础 URL（本服务的公网地址）
+        self.epay_notify_base_url = os.getenv('EPAY_NOTIFY_BASE_URL', 'http://localhost:5000').strip()
+        
+        # 数据库配置
+        db_type = os.getenv('DATABASE_TYPE', 'sqlite').lower()
+        if db_type == 'mysql':
+            # MySQL 配置
+            self.db_url = (
+                f"mysql+pymysql://"
+                f"{os.getenv('MYSQL_USER', 'root')}:"
+                f"{os.getenv('MYSQL_PASSWORD', 'password')}@"
+                f"{os.getenv('MYSQL_HOST', 'localhost')}:"
+                f"{os.getenv('MYSQL_PORT', '3306')}/"
+                f"{os.getenv('MYSQL_DB', 'alipay_db')}"
+            )
+        else:
+            # SQLite 配置（默认）
+            db_path = os.getenv('SQLITE_PATH', './data/orders.db')
+            os.makedirs(os.path.dirname(db_path) or '.', exist_ok=True)
+            self.db_url = f"sqlite:///{db_path}"
+        
+        logger.info(f"✓ EPay 配置已加载")
+        logger.debug(f"  - 商户 ID: {self.epay_merchant_id}")
+        logger.debug(f"  - 回调地址前缀: {self.epay_notify_base_url}")
+        logger.debug(f"  - 数据库: {db_type}")
+
     def _load_integration_config(self):
         """加载集成相关配置"""
         log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
@@ -113,8 +151,14 @@ try:
     RETURN_URL = config.return_url
     GATEWAY = config.gateway
     
+    # EPay 配置
+    EPAY_MERCHANT_ID = config.epay_merchant_id
+    EPAY_MERCHANT_KEY = config.epay_merchant_key
+    EPAY_NOTIFY_BASE_URL = config.epay_notify_base_url
+    DATABASE_URL = config.db_url
+    
     logger.info("="*60)
-    logger.info("🎉 支付宝配置初始化成功！")
+    logger.info("🎉 支付宝配置 + EPay 配置初始化成功！")
     logger.info("="*60)
 
 except ValueError as e:
