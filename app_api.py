@@ -93,6 +93,16 @@ Base.metadata.create_all(bind=engine)
 
 
 # =====================================================================
+# 商品价目表（后端硬编码，防止前端篡改金额）
+# =====================================================================
+
+PRODUCTS = {
+    'account': {'name': '账号购买', 'price': 1.0},
+}
+DEFAULT_PRODUCT = 'account'
+
+
+# =====================================================================
 # 辅助函数
 # =====================================================================
 
@@ -434,32 +444,26 @@ def pay_now() -> Response:
     直接跳转到支付宝扫码页面（浏览器自动重定向）
 
     URL 参数：
-    - total_amount 或 amount: 订单金额（元），必需，必须大于0
-    - subject: 商品标题/描述，必需
+    - product: 商品 ID（可选，默认 account）
     - out_trade_no: 商户订单号（可选，不传自动生成）
-
-    使用示例：
-    <a href="/paynow?amount=0.01&subject=测试商品">立即购买</a>
+    注意：金额和商品名称由后端 PRODUCTS 价目表决定，前端无法篡改。
 
     返回：支付成功页面 HTML
     """
-    # 获取参数（支持 total_amount 或 amount 两种参数名）
-    try:
-        amount_float = validate_amount(
-            request.args.get('total_amount') or request.args.get('amount'),
-            "金额"
-        )
-        subject = validate_required(request.args.get('subject'), "商品标题")
-        out_trade_no = request.args.get('out_trade_no') or None
-    except ValueError as e:
-        logger.warning(f"❌ 参数校验失败: {e}")
-        return error_response(str(e))
+    product_id = request.args.get('product', DEFAULT_PRODUCT)
+    product = PRODUCTS.get(product_id)
+    if not product:
+        return error_response(f"商品不存在: {product_id}", 400)
+
+    amount_float = product['price']
+    subject = product['name']
+    out_trade_no = request.args.get('out_trade_no') or None
 
     # 生成订单号
     order_id = out_trade_no or str(uuid.uuid4()).replace('-', '')[:20]
 
     try:
-        logger.info(f"创建支付: order_id={order_id}, amount={amount_float}, subject={subject}")
+        logger.info(f"创建支付: order_id={order_id}, product={product_id}, amount={amount_float}, subject={subject}")
         qr_code = alipay_service.create_qr_payment(
             out_trade_no=order_id,
             total_amount=amount_float,
@@ -554,7 +558,8 @@ def get_account():
     if not out_trade_no:
         return error_response("订单号不能为空")
 
-    # 校验订单支付状态
+    # 校验订单支付状态 + 金额
+    min_price = PRODUCTS[DEFAULT_PRODUCT]['price']
     db = SessionLocal()
     try:
         order = db.query(PayOrder).filter(PayOrder.out_trade_no == out_trade_no).first()
@@ -572,6 +577,11 @@ def get_account():
 
         if not paid:
             return error_response("订单未支付，无法获取账号", 403)
+
+        # 校验实付金额（防止通过旧接口/篡改金额下单）
+        if order and order.money is not None and order.money < min_price:
+            logger.warning(f"[ACCOUNT] 金额不足: order={out_trade_no}, money={order.money}, min={min_price}")
+            return error_response(f"支付金额不足（需 {min_price} 元）", 403)
     finally:
         db.close()
 
