@@ -10,6 +10,7 @@
 - 订单数据持久化到数据库
 """
 
+import os
 import uuid
 import logging
 import requests
@@ -531,6 +532,87 @@ def create_pay() -> Tuple:
 def test_page():
     """支付测试页面"""
     return render_template('test_pay.html')
+
+
+# 账号文件路径（每行一条 "账号|密码"），位于项目根目录
+ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accounts.txt')
+_accounts_lock = threading.Lock()
+
+
+@app.route('/api/get-account', methods=['GET', 'POST'])
+def get_account():
+    """
+    读取 accounts.txt 第一行 "账号|密码"，并从文件中移除（消费式）。
+
+    参数：
+    - out_trade_no: 订单号（必需，必须是已支付状态，防止未支付套取账号）
+
+    返回：
+    {"code": 0, "account": "xxx", "password": "yyy"}
+    """
+    out_trade_no = (request.values.get('out_trade_no') or '').strip()
+    if not out_trade_no:
+        return error_response("订单号不能为空")
+
+    # 校验订单支付状态
+    db = SessionLocal()
+    try:
+        order = db.query(PayOrder).filter(PayOrder.out_trade_no == out_trade_no).first()
+        paid = False
+        if order and order.status in (1, 2):
+            paid = True
+        else:
+            # 兜底：直接查询支付宝
+            try:
+                result = alipay_service.query_order(out_trade_no)
+                if (result.get('trade_status') or '') in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
+                    paid = True
+            except Exception:
+                paid = False
+
+        if not paid:
+            return error_response("订单未支付，无法获取账号", 403)
+    finally:
+        db.close()
+
+    # 读取并消费第一行
+    with _accounts_lock:
+        if not os.path.exists(ACCOUNTS_FILE):
+            return error_response(f"账号文件不存在: {ACCOUNTS_FILE}", 500)
+        try:
+            with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            # 找到第一条非空行
+            first_idx = -1
+            first_line = ''
+            for i, line in enumerate(lines):
+                if line.strip():
+                    first_idx = i
+                    first_line = line.strip()
+                    break
+
+            if first_idx < 0:
+                return error_response("账号库已空，请补充 accounts.txt", 500)
+
+            # 解析 账号|密码
+            if '|' not in first_line:
+                return error_response(f"账号行格式错误（应为 账号|密码）: {first_line}", 500)
+            account, password = first_line.split('|', 1)
+
+            # 移除该行
+            remaining = lines[:first_idx] + lines[first_idx + 1:]
+            with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+                f.writelines(remaining)
+
+            logger.info(f"[ACCOUNT] 发放账号 order={out_trade_no}, account={account}")
+            return success_response({
+                'account': account.strip(),
+                'password': password.strip(),
+            })
+        except Exception as e:
+            logger.error(f"[ACCOUNT] 读取账号失败: {e}", exc_info=True)
+            return error_response(f"读取账号失败: {str(e)}", 500)
 
 
 @app.route('/api/order/query/<order_id>', methods=['GET'])
