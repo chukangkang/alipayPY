@@ -543,6 +543,20 @@ ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'accoun
 _accounts_lock = threading.Lock()
 
 
+@app.route('/api/account-stock', methods=['GET'])
+def account_stock():
+    """查询 accounts.txt 剩余可用账号数量"""
+    try:
+        if not os.path.exists(ACCOUNTS_FILE):
+            return success_response({'stock': 0})
+        with open(ACCOUNTS_FILE, 'r', encoding='utf-8') as f:
+            count = sum(1 for line in f if line.strip() and '|' in line)
+        return success_response({'stock': count})
+    except Exception as e:
+        logger.error(f"[ACCOUNT] 查询库存失败: {e}")
+        return error_response(str(e), 500)
+
+
 @app.route('/api/get-account', methods=['GET', 'POST'])
 def get_account():
     """

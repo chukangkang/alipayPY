@@ -34,7 +34,8 @@
     <div class="container">
         <h2>账号购买</h2>
         <div style="font-size:32px;color:#ff4d4f;font-weight:bold;margin-bottom:16px">¥1.00</div>
-        <div style="color:#666;font-size:14px;margin-bottom:20px">支付后自动发放账号密码</div>
+        <div style="color:#666;font-size:14px;margin-bottom:8px">支付后自动发放账号密码</div>
+        <div id="stockInfo" style="color:#999;font-size:13px;margin-bottom:20px">剩余库存：加载中...</div>
         <button class="btn" id="payBtn">立即支付 ¥1.00</button>
 
         <div class="status-box" id="statusBox"></div>
@@ -82,6 +83,7 @@ function fetchAccount(orderId) {
                 document.getElementById('pwdVal').textContent = data.password || '';
                 document.getElementById('accountCard').classList.add('show');
                 setStatus('支付成功，账号已发放', 'success');
+                refreshStock();
             } else {
                 setStatus('获取账号失败：' + (data.message || '未知错误'), 'error');
             }
@@ -135,6 +137,29 @@ function doPay() {
 }
 
 document.getElementById('payBtn').addEventListener('click', doPay);
+
+function refreshStock() {
+    fetch('/api/account-stock')
+        .then(r => r.json())
+        .then(data => {
+            const el = document.getElementById('stockInfo');
+            if (data.code === 0) {
+                const n = data.stock || 0;
+                el.textContent = '剩余库存：' + n + ' 个';
+                el.style.color = n > 0 ? '#389e0d' : '#cf1322';
+                if (n <= 0) {
+                    document.getElementById('payBtn').disabled = true;
+                    document.getElementById('payBtn').textContent = '已售罄';
+                }
+            } else {
+                el.textContent = '库存查询失败';
+            }
+        })
+        .catch(() => {
+            document.getElementById('stockInfo').textContent = '库存查询失败';
+        });
+}
+refreshStock();
 
 // 复制按钮
 document.querySelectorAll('.copy-btn').forEach(btn => {
