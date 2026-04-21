@@ -14,6 +14,20 @@
         input:focus { outline: none; border-color: #1677ff; }
         .btn { width: 100%; padding: 12px; background: #1677ff; color: #fff; border: none; border-radius: 6px; font-size: 16px; cursor: pointer; margin-top: 10px; }
         .btn:hover { background: #4096ff; }
+        .btn:disabled { background: #bfbfbf; cursor: not-allowed; }
+        .status-box { margin-top: 18px; padding: 12px; border-radius: 6px; font-size: 14px; display: none; }
+        .status-box.waiting { display: block; background: #fff7e6; color: #d46b08; }
+        .status-box.success { display: block; background: #f6ffed; color: #389e0d; }
+        .status-box.error { display: block; background: #fff2f0; color: #cf1322; }
+        .account-card { margin-top: 18px; padding: 16px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 8px; text-align: left; display: none; }
+        .account-card.show { display: block; }
+        .account-card h3 { margin: 0 0 10px; color: #389e0d; font-size: 16px; }
+        .account-card .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px dashed #d9f7be; }
+        .account-card .row:last-child { border-bottom: none; }
+        .account-card .label { color: #666; font-size: 13px; }
+        .account-card .value { font-family: Consolas, Menlo, monospace; color: #222; font-weight: bold; user-select: all; }
+        .copy-btn { margin-left: 8px; padding: 2px 8px; font-size: 12px; background: #fff; border: 1px solid #b7eb8f; color: #389e0d; border-radius: 4px; cursor: pointer; }
+        .copy-btn:hover { background: #f6ffed; }
     </style>
 </head>
 <body>
@@ -31,28 +45,137 @@
         </div>
         
         <button class="btn" id="payBtn">立即支付</button>
+
+        <div class="status-box" id="statusBox"></div>
+
+        <div class="account-card" id="accountCard">
+            <h3>🎉 支付成功，账号信息如下</h3>
+            <div class="row">
+                <span class="label">账号</span>
+                <span><span class="value" id="accVal"></span><button class="copy-btn" data-target="accVal">复制</button></span>
+            </div>
+            <div class="row">
+                <span class="label">密码</span>
+                <span><span class="value" id="pwdVal"></span><button class="copy-btn" data-target="pwdVal">复制</button></span>
+            </div>
+        </div>
     </div>
 
 <script>
+let pollTimer = null;
+let pollTimeoutTimer = null;
+
+function genOrderId() {
+    // 生成 20 位随机订单号（与后端 /paynow 默认逻辑一致）
+    return (Date.now().toString(36) + Math.random().toString(36).slice(2)).replace(/[^a-z0-9]/gi, '').slice(0, 20);
+}
+
+function setStatus(text, type) {
+    const box = document.getElementById('statusBox');
+    box.className = 'status-box ' + (type || '');
+    box.textContent = text;
+}
+
+function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (pollTimeoutTimer) { clearTimeout(pollTimeoutTimer); pollTimeoutTimer = null; }
+}
+
+function fetchAccount(orderId) {
+    setStatus('支付成功，正在获取账号...', 'waiting');
+    fetch('/api/get-account?out_trade_no=' + encodeURIComponent(orderId))
+        .then(r => r.json())
+        .then(data => {
+            if (data.code === 0) {
+                document.getElementById('accVal').textContent = data.account || '';
+                document.getElementById('pwdVal').textContent = data.password || '';
+                document.getElementById('accountCard').classList.add('show');
+                setStatus('支付成功，账号已发放', 'success');
+            } else {
+                setStatus('获取账号失败：' + (data.message || '未知错误'), 'error');
+            }
+        })
+        .catch(err => {
+            setStatus('获取账号失败：' + err, 'error');
+        })
+        .finally(() => {
+            document.getElementById('payBtn').disabled = false;
+        });
+}
+
+function startPolling(orderId) {
+    setStatus('已打开支付页面，等待支付中...', 'waiting');
+    document.getElementById('accountCard').classList.remove('show');
+
+    pollTimer = setInterval(() => {
+        fetch('/api/order/query/' + encodeURIComponent(orderId))
+            .then(r => r.json())
+            .then(data => {
+                const st = (data.trade_status || '').trim();
+                if (st === 'TRADE_SUCCESS' || st === 'TRADE_FINISHED') {
+                    stopPolling();
+                    fetchAccount(orderId);
+                } else if (st === 'TRADE_CLOSED') {
+                    stopPolling();
+                    setStatus('订单已关闭', 'error');
+                    document.getElementById('payBtn').disabled = false;
+                }
+            })
+            .catch(() => {});
+    }, 2000);
+
+    // 5 分钟超时
+    pollTimeoutTimer = setTimeout(() => {
+        stopPolling();
+        setStatus('支付超时，请重新发起', 'error');
+        document.getElementById('payBtn').disabled = false;
+    }, 5 * 60 * 1000);
+}
+
 function doPay() {
     const amount = document.getElementById('amount').value;
     const subject = document.getElementById('subject').value;
-    
+
     if (!amount || parseFloat(amount) <= 0) {
         alert('请输入有效金额');
         return;
     }
-    
     if (!subject) {
         alert('请输入商品标题');
         return;
     }
-    
-    // 新标签页打开支付页面，当前页面保持不变
-    window.open(`/paynow?amount=${amount}&subject=${encodeURIComponent(subject)}`, '_blank');
+
+    stopPolling();
+    const orderId = genOrderId();
+    document.getElementById('payBtn').disabled = true;
+
+    const url = `/paynow?amount=${amount}&subject=${encodeURIComponent(subject)}&out_trade_no=${orderId}`;
+    window.open(url, '_blank');
+
+    startPolling(orderId);
 }
 
 document.getElementById('payBtn').addEventListener('click', doPay);
+
+// 复制按钮
+document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+        const target = document.getElementById(btn.dataset.target);
+        const text = target ? target.textContent : '';
+        if (!text) return;
+        navigator.clipboard.writeText(text).then(() => {
+            const old = btn.textContent;
+            btn.textContent = '已复制';
+            setTimeout(() => { btn.textContent = old; }, 1200);
+        }).catch(() => {
+            // 降级
+            const ta = document.createElement('textarea');
+            ta.value = text; document.body.appendChild(ta); ta.select();
+            try { document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+        });
+    });
+});
 </script>
 </body>
 </html>
