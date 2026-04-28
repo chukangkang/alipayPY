@@ -128,6 +128,11 @@ class Config:
         self.flask_host = os.getenv('FLASK_HOST', '0.0.0.0')
         self.flask_port = int(os.getenv('FLASK_PORT', 5000))
 
+        # 管理员 API Key（保护敏感接口：退款、撤单、创建支付等）
+        self.admin_api_key = os.getenv('ADMIN_API_KEY', '').strip()
+        if not self.admin_api_key:
+            logger.warning("⚠️  未配置 ADMIN_API_KEY，敏感管理接口将不可用")
+
         logger.info(f"✓ 集成配置已加载")
         logger.debug(f"  - 日志级别: {self.log_level}")
         logger.debug(f"  - Flask 环境: {self.flask_env}")

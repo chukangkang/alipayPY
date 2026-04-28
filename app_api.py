@@ -83,6 +83,9 @@ class PayOrder(Base):
     # 通知重试
     notify_count = Column(Integer, default=0)  # 已通知次数
     
+    # 账号发放状态（防重放）
+    account_dispensed = Column(Integer, default=0)  # 0=未发放, 1=已发放
+    
     # 时间戳
     created_at = Column(DateTime, default=datetime.utcnow())
     updated_at = Column(DateTime, default=datetime.utcnow(), onupdate=datetime.utcnow())
@@ -100,6 +103,25 @@ PRODUCTS = {
     'account': {'name': '账号购买', 'price': 1.0},
 }
 DEFAULT_PRODUCT = 'account'
+
+
+def require_admin_key(f):
+    """管理员 API Key 认证装饰器"""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not config.admin_api_key:
+            return error_response("管理接口未配置 ADMIN_API_KEY，拒绝访问", 403)
+        # 支持 Authorization: Bearer <key> 或 ?api_key=<key>
+        auth_header = request.headers.get('Authorization', '')
+        if auth_header.startswith('Bearer '):
+            provided_key = auth_header[7:].strip()
+        else:
+            provided_key = (request.values.get('api_key') or '').strip()
+        if not provided_key or provided_key != config.admin_api_key:
+            logger.warning(f"[AUTH] 管理接口鉴权失败, path={request.path}")
+            return error_response("API Key 无效", 403)
+        return f(*args, **kwargs)
+    return decorated
 
 
 # =====================================================================
@@ -492,6 +514,7 @@ def pay_now() -> Response:
 # =====================================================================
 
 @app.route('/api/pay/create', methods=['POST'])
+@require_admin_key
 def create_pay() -> Tuple:
     """创建支付二维码（API 接口）"""
     data = request.get_json() or {}
@@ -577,25 +600,41 @@ def get_account():
     db = SessionLocal()
     try:
         order = db.query(PayOrder).filter(PayOrder.out_trade_no == out_trade_no).first()
+
+        # 【安全修复】订单必须在数据库中存在（仅通过 /submit.php 创建的订单才有效）
+        if not order:
+            logger.warning(f"[ACCOUNT] 订单不在数据库中, 拒绝: {out_trade_no}")
+            return error_response("订单不存在（仅支持通过正规渠道创建的订单）", 403)
+
+        # 【安全修复】防重放：同一订单只能发放一次账号
+        if order.account_dispensed == 1:
+            logger.warning(f"[ACCOUNT] 订单已发放过账号, 拒绝重复发放: {out_trade_no}")
+            return error_response("该订单已领取过账号，不可重复领取", 403)
+
+        # 【安全修复】强制校验金额（不再短路跳过）
+        if order.money is None or order.money < min_price:
+            logger.warning(f"[ACCOUNT] 金额不足: order={out_trade_no}, money={order.money}, min={min_price}")
+            return error_response(f"支付金额不足（需 {min_price} 元）", 403)
+
+        # 校验支付状态
         paid = False
-        if order and order.status in (1, 2):
+        if order.status in (1, 2):
             paid = True
         else:
-            # 兜底：直接查询支付宝
+            # 兜底：查询支付宝确认支付状态
             try:
                 result = alipay_service.query_order(out_trade_no)
                 if (result.get('trade_status') or '') in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
+                    # 同步更新本地状态
+                    order.status = 1
+                    order.alipay_trade_no = result.get('trade_no', '')
+                    db.commit()
                     paid = True
             except Exception:
                 paid = False
 
         if not paid:
             return error_response("订单未支付，无法获取账号", 403)
-
-        # 校验实付金额（防止通过旧接口/篡改金额下单）
-        if order and order.money is not None and order.money < min_price:
-            logger.warning(f"[ACCOUNT] 金额不足: order={out_trade_no}, money={order.money}, min={min_price}")
-            return error_response(f"支付金额不足（需 {min_price} 元）", 403)
     finally:
         db.close()
 
@@ -628,6 +667,20 @@ def get_account():
             remaining = lines[:first_idx] + lines[first_idx + 1:]
             with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
                 f.writelines(remaining)
+
+            # 【安全修复】标记订单为已发放，防止重复领取
+            db2 = SessionLocal()
+            try:
+                db_order = db2.query(PayOrder).filter(
+                    PayOrder.out_trade_no == out_trade_no
+                ).first()
+                if db_order:
+                    db_order.account_dispensed = 1
+                    db2.commit()
+            except Exception as e:
+                logger.error(f"[ACCOUNT] 标记已发放失败: {e}")
+            finally:
+                db2.close()
 
             logger.info(f"[ACCOUNT] 发放账号 order={out_trade_no}, account={account}")
             return success_response({
@@ -673,6 +726,7 @@ def query_order(order_id):
 
 
 @app.route('/api/order/cancel/<order_id>', methods=['POST'])
+@require_admin_key
 def cancel_order(order_id):
     """撤销订单"""
     if not order_id or not order_id.strip():
@@ -692,6 +746,7 @@ def cancel_order(order_id):
 
 
 @app.route('/api/refund', methods=['POST'])
+@require_admin_key
 def refund() -> Tuple:
     """订单退款"""
     data = request.get_json() or {}
@@ -773,6 +828,22 @@ def alipay_notify():
             ).first()
             
             if order:
+                # 【安全修复】校验回调金额与订单金额是否一致
+                if total_amount and order.money is not None:
+                    try:
+                        callback_amount = float(total_amount)
+                        if abs(callback_amount - order.money) > 0.01:
+                            logger.error(
+                                f"[NOTIFY] ❌ 金额不一致! 订单={order.money}, 回调={callback_amount}, "
+                                f"order={out_trade_no}"
+                            )
+                            db.close()
+                            return 'fail'
+                    except (ValueError, TypeError):
+                        logger.error(f"[NOTIFY] ❌ 回调金额格式异常: {total_amount}")
+                        db.close()
+                        return 'fail'
+
                 if order.status == 0:  # 还未支付
                     order.status = 1  # 标记为已支付
                     order.alipay_trade_no = trade_no
