@@ -100,7 +100,7 @@ Base.metadata.create_all(bind=engine)
 # =====================================================================
 
 PRODUCTS = {
-    'account': {'name': '账号购买', 'price': 1.0},
+    'account': {'name': '账号购买', 'price': 5.0},
 }
 DEFAULT_PRODUCT = 'account'
 
@@ -457,20 +457,19 @@ def check_status():
 
 
 # =====================================================================
-# 【现有】直接渲染支付宝扫码页面
+# 【统一入口】直接购买页面（内部走 /submit.php 同样的数据库入库逻辑）
 # =====================================================================
 
 @app.route('/paynow')
 def pay_now() -> Response:
     """
-    直接跳转到支付宝扫码页面（浏览器自动重定向）
+    直接购买接口 - 金额由后端 PRODUCTS 价目表决定，订单统一入库。
 
     URL 参数：
     - product: 商品 ID（可选，默认 account）
     - out_trade_no: 商户订单号（可选，不传自动生成）
-    注意：金额和商品名称由后端 PRODUCTS 价目表决定，前端无法篡改。
 
-    返回：支付成功页面 HTML
+    返回：支付二维码页面 HTML
     """
     product_id = request.args.get('product', DEFAULT_PRODUCT)
     product = PRODUCTS.get(product_id)
@@ -479,80 +478,66 @@ def pay_now() -> Response:
 
     amount_float = product['price']
     subject = product['name']
-    out_trade_no = request.args.get('out_trade_no') or None
+    out_trade_no = request.args.get('out_trade_no') or str(uuid.uuid4()).replace('-', '')[:20]
 
-    # 生成订单号
-    order_id = out_trade_no or str(uuid.uuid4()).replace('-', '')[:20]
-
+    db = None
     try:
-        logger.info(f"创建支付: order_id={order_id}, product={product_id}, amount={amount_float}, subject={subject}")
+        db = next(get_db())
+
+        # 幂等：订单已存在则直接返回
+        existing = db.query(PayOrder).filter(PayOrder.out_trade_no == out_trade_no).first()
+        if existing and existing.qr_code:
+            return render_template('pay.html',
+                order_id=out_trade_no,
+                qr_code=existing.qr_code,
+                amount=str(existing.money),
+                subject=existing.name
+            )
+
+        # 创建支付宝预下单
+        logger.info(f"[paynow] 创建支付: order={out_trade_no}, product={product_id}, amount={amount_float}")
+        trade_no = f"PN{datetime.now().strftime('%Y%m%d%H%M%S')}{uuid.uuid4().hex[:8]}"
         qr_code = alipay_service.create_qr_payment(
-            out_trade_no=order_id,
+            out_trade_no=out_trade_no,
             total_amount=amount_float,
             subject=subject,
         )
-
         if not qr_code:
-            logger.error("支付宝未返回二维码")
-            return "❌ 支付创建失败：未获取到二维码", 400
+            return "支付创建失败：未获取到二维码", 400
 
-        # 渲染二维码页面
+        # 订单入库（与 /submit.php 一致）
+        order = PayOrder(
+            out_trade_no=out_trade_no,
+            trade_no=trade_no,
+            pid=int(config.epay_merchant_id),
+            type='alipay',
+            name=subject,
+            money=amount_float,
+            notify_url='',
+            return_url='',
+            qr_code=qr_code,
+            status=0
+        )
+        db.add(order)
+        db.commit()
+        logger.info(f"[paynow] ✓ 订单已入库: {out_trade_no}")
+
         return render_template('pay.html',
-            order_id=order_id,
+            order_id=out_trade_no,
             qr_code=qr_code,
             amount=str(amount_float),
             subject=subject
         )
 
     except Exception as e:
-        logger.error(f"❌ 创建支付失败: {e}")
-        return f"❌ 支付创建失败：{str(e)}", 500
-
-
-# =====================================================================
-# 【现有】其他接口
-# =====================================================================
-
-@app.route('/api/pay/create', methods=['POST'])
-@require_admin_key
-def create_pay() -> Tuple:
-    """创建支付二维码（API 接口）"""
-    data = request.get_json() or {}
-
-    # 参数提取和校验
-    try:
-        amount_float = validate_amount(data.get('total_amount'), "金额")
-        subject = validate_required(data.get('subject'), "商品标题")
-        out_trade_no = data.get('out_trade_no') or None
-    except ValueError as e:
-        logger.warning(f"❌ API 参数校验失败: {e}")
-        return error_response(str(e))
-
-    # 生成订单号
-    order_id = out_trade_no or str(uuid.uuid4()).replace('-', '')[:20]
-
-    try:
-        logger.info(f"API 创建支付: order_id={order_id}, amount={amount_float}, subject={subject}")
-        qr_code = alipay_service.create_qr_payment(
-            out_trade_no=order_id,
-            total_amount=amount_float,
-            subject=subject,
-        )
-        
-        logger.info(f"✓ API 创建支付成功: order_id={order_id}")
-        host_url = request.host_url.rstrip('/')
-
-        return success_response({
-            'qr_code': qr_code,
-            'pay_url': f"{host_url}/pay/{order_id}?qr={qr_code}",
-            'order_id': order_id,
-            'amount': amount_float,
-            'subject': subject
-        })
-
-    except Exception as e:
-        logger.error(f"❌ API 创建支付异常: {e}")
-        return error_response(str(e), 500)
+        logger.error(f"[paynow] ❌ 创建支付失败: {e}")
+        return f"支付创建失败：{str(e)}", 500
+    finally:
+        if db:
+            try:
+                db.close()
+            except:
+                pass
 
 
 @app.route('/test')
