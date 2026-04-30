@@ -122,6 +122,10 @@ class Config:
         log_level = os.getenv('LOG_LEVEL', 'INFO').upper()
         self.log_level = log_level
 
+        # 日志文件配置
+        self.log_dir = os.getenv('LOG_DIR', './logs').strip()
+        self.log_backup_count = int(os.getenv('LOG_BACKUP_COUNT', '30'))
+
         # Flask 配置
         self.flask_secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key-change-in-production')
         self.flask_env = os.getenv('FLASK_ENV', 'development')

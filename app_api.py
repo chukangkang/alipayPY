@@ -13,6 +13,7 @@
 import os
 import uuid
 import logging
+import logging.handlers
 import requests
 import threading
 from typing import Any, Optional, Dict, Tuple
@@ -28,11 +29,34 @@ from alipay_service import AlipayService, verify_sign
 from alipay_config import config
 from epay_util import sign_epay, verify_epay_sign, build_epay_notify_params
 
-# 设置日志
-logging.basicConfig(
-    level=config.log_level,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# 设置日志（按天切割）
+def _setup_logging():
+    log_dir = config.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, 'api.log')
+    fmt = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    # 文件处理器：每天午夜切割，保留 N 天
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        filename=log_file,
+        when='midnight',
+        interval=1,
+        backupCount=config.log_backup_count,
+        encoding='utf-8',
+    )
+    file_handler.suffix = '%Y-%m-%d'
+    file_handler.setFormatter(fmt)
+
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(config.log_level)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+
+_setup_logging()
 logger = logging.getLogger(__name__)
 
 
