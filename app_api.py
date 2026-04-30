@@ -326,8 +326,12 @@ def submit_order():
                     order_id=out_trade_no,
                     qr_code=existing_order.qr_code,
                     amount=str(existing_order.money),
-                    subject=existing_order.name
+                    subject=existing_order.name,
+                    return_url=existing_order.return_url or ''
                 )
+            else:
+                logger.warning(f"[EPay] 订单已存在但无二维码, 返回错误: {out_trade_no}")
+                return "订单异常，请重新发起支付", 400
         
         # 5. 调用支付宝创建支付
         logger.info(f"[EPay] 创建支付: order={out_trade_no}, type={pay_type}, amount={money}")
@@ -373,7 +377,8 @@ def submit_order():
             order_id=out_trade_no,
             qr_code=qr_code,
             amount=str(money),
-            subject=name
+            subject=name,
+            return_url=return_url
         )
     
     except ValueError as e:
@@ -422,14 +427,22 @@ def check_status():
         trade_status = result.get('trade_status', '')
         
         if trade_status in ('TRADE_SUCCESS', 'TRADE_FINISHED'):
-            # 支付成功，更新本地订单
-            if order.status == 0:
-                order.status = 1  # 标记为已支付
-                order.alipay_trade_no = result.get('trade_no', '')
+            # 支付成功，使用行级锁防止竞态条件重复回调
+            order_locked = db.query(PayOrder).filter(
+                PayOrder.out_trade_no == out_trade_no,
+                PayOrder.status == 0
+            ).with_for_update().first()
+            
+            if order_locked:
+                order_locked.status = 1  # 标记为已支付
+                order_locked.alipay_trade_no = result.get('trade_no', '')
                 db.commit()
+                logger.info(f"[check-status] ✓ 订单已更新为已支付: {out_trade_no}")
                 
                 # 异步回调 New-API
-                notify_new_api_async(order)
+                notify_new_api_async(order_locked)
+            else:
+                logger.info(f"[check-status] 订单已被其他流程处理，跳过回调: {out_trade_no}")
             
             return success_response({
                 'status': 1,
@@ -829,15 +842,22 @@ def alipay_notify():
                         db.close()
                         return 'fail'
 
-                if order.status == 0:  # 还未支付
-                    order.status = 1  # 标记为已支付
-                    order.alipay_trade_no = trade_no
+                # 使用行级锁防止竞态条件重复回调
+                order_locked = db.query(PayOrder).filter(
+                    PayOrder.out_trade_no == out_trade_no,
+                    PayOrder.status == 0
+                ).with_for_update().first()
+                
+                if order_locked:
+                    order_locked.status = 1  # 标记为已支付
+                    order_locked.alipay_trade_no = trade_no
                     db.commit()
+                    logger.info(f"[NOTIFY] ✓ 订单状态已更新: {out_trade_no}")
                     
                     # 异步回调 New-API
-                    notify_new_api_async(order)
+                    notify_new_api_async(order_locked)
                 else:
-                    logger.info(f"订单已处理，跳过: {out_trade_no}")
+                    logger.info(f"[NOTIFY] 订单已被其他流程处理，跳过回调: {out_trade_no}")
             
             db.close()
         except Exception as e:

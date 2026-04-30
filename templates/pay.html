@@ -59,10 +59,11 @@
     </div>
 
 <script>
-const orderId = '{{ order_id }}';
-const qrCode  = '{{ qr_code }}';
-const amount  = parseFloat('{{ amount }}') || 0;
-const subject = '{{ subject }}';
+const orderId   = '{{ order_id }}';
+const qrCode    = '{{ qr_code }}';
+const amount    = parseFloat('{{ amount }}') || 0;
+const subject   = '{{ subject }}';
+const returnUrl = '{{ return_url | default("", true) }}';
 
 document.getElementById('subject').textContent = subject;
 document.getElementById('amount').textContent  = '¥' + amount.toFixed(2);
@@ -83,19 +84,23 @@ function showSuccess() {
     mask.style.display = 'flex';
     document.getElementById('pay-amount-tip').textContent = '实付 ¥' + amount.toFixed(2);
 
-    // 倒计时 5 秒后关闭/刷新（可自行改成跳转）
+    // 倒计时 5 秒后跳转 return_url 或关闭
     let sec = 5;
     const cd = document.getElementById('countdown');
-    cd.textContent = sec + ' 秒后自动关闭页面...';
+    const targetUrl = returnUrl || '/';
+    cd.textContent = sec + ' 秒后自动跳转...';
     const t = setInterval(() => {
         sec--;
         if (sec <= 0) {
             clearInterval(t);
-            window.close();           // 尝试关闭标签页
-            // 若无法关闭则跳转首页
-            setTimeout(() => { window.location.href = '/'; }, 300);
+            if (returnUrl) {
+                window.location.href = returnUrl;
+            } else {
+                window.close();
+                setTimeout(() => { window.location.href = '/'; }, 300);
+            }
         } else {
-            cd.textContent = sec + ' 秒后自动关闭页面...';
+            cd.textContent = sec + ' 秒后自动跳转...';
         }
     }, 1000);
 }
@@ -106,16 +111,15 @@ function showClosed() {
     document.getElementById('closed-view').style.display = 'block';
 }
 
-// 轮询订单状态（每 2 秒一次）
+// 轮询订单状态（每 2 秒一次，使用 /api/check-status 触发服务端回调）
 const pollTimer = setInterval(() => {
-    fetch('/api/order/query/' + orderId)
+    fetch('/api/check-status?out_trade_no=' + encodeURIComponent(orderId))
         .then(r => r.json())
         .then(data => {
-            const st = (data.trade_status || '').trim();
-            if (st === 'TRADE_SUCCESS' || st === 'TRADE_FINISHED') {
+            if (data.status === 1) {
                 clearInterval(pollTimer);
                 showSuccess();
-            } else if (st === 'TRADE_CLOSED') {
+            } else if (data.message === '订单已关闭') {
                 clearInterval(pollTimer);
                 showClosed();
             }
